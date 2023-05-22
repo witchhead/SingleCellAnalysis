@@ -1,0 +1,358 @@
+---
+title: "SingleCellAnalysis"
+author: "JuHyunJeon"
+date: "2023-05-22"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Introduction
+
+This is a github project following the youtube series made for single cell analysis.
+
+### Installing libraries.
+
+```{r, echo=FALSE}
+#update.packages()
+#install.packages('installr')
+#install.packages("rlang")
+#library(installr)
+#updateR()
+#install.packages('dplyr')
+#install.packages('Seurat')
+#install.packages('tidyverse')
+#install.packages('patchwork')
+#remove.packages("rlang")
+#install.packages("rlang")
+#remove.packages("htmltools")
+#install.packages("htmltools")
+
+library(rlang)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(Seurat)
+library(SeuratDisk)
+library(SeuratData)
+library(patchwork)
+library(gridExtra)
+library(DoubletFinder)
+```
+
+### Difference of sc RNA seq and bulk RNA seq
+
+When used on a heterogeneous tissue
+
+single cell RNA sequencing
+
+-   allows comparison of the transcriptomes of individual cells
+
+-   assess transcriptional similarities and differences within population of cells
+
+-   identify rare cell populations
+
+-   trace lineage and developmental relationships between heterogeneous cell states
+
+bulk RNA sequencing
+
+-   estimate average level for each gene across the whole population
+
+-   used to characterize expression signatures between two groups or conditions
+
+-   used to find and annotate new genes and transcripts
+
+## Reading different types of Single Cell Data as Seurat object
+
+| Name           | Extension |
+|----------------|-----------|
+| 10x hdf5       | .hdf5     |
+| R Data Format  | .rds      |
+| AnnData        | .h5ad     |
+| Loom           | .loom     |
+| text based MEX | .mtx      |
+
+```{r, eval = FALSE}
+# Read 10x .hdf5 file
+hdf5_obj <- read10X_h5(filename = "name.hdf5",
+                       use.names = TRUE,
+                       unique.features = TRUE)
+# hdf5_obj is not a seurat object so you create a new object
+hdf5_seurat_obj <- CreateSeuratObject(counts = hdf5_obj)
+
+# Read RDS file
+rds_obj <- readRDS("name.rds")
+
+# Read .h5ad file
+#convert anndata to h5seurat file
+Convert("name.h5ad", dest = "h5Seurat", overwrite = TRUE)
+# h5seurat is not a seurat object so you create a new object
+h5ad_seurat_obj <- LoadH5Seurat("name.h5Seurat")
+
+# Read .loom file
+loom_obj <- Connect(filename = "filename.loom", mode = 'r')
+# loom_obj is not a seurat object so you create a new object
+loom_seurat_obj <- as.Seurat(loom_obj)
+
+# Read .mtx file
+mtx_obj <- ReadMtx(mtx = "matrix.mtx.gz",
+                   features = "features.tsv.gz",
+                   cells = "barcodes.tsv.gz")
+# mtx_obj is not a seurat object so you create a new object
+mtx_seurat_obj <- CreateSeuratObject(counts = mtx_obj)
+
+```
+
+## Single Cell Analysis
+
+```{r}
+h5data <- Read10X_h5(filename = "data/20k_NSCLC_DTC_3p_nextgem_Multiplex_count_raw_feature_bc_matrix.h5")
+# This dataset has multiple modalities, so check how the data looks like before starting analysis.
+str(h5data)
+# since we are focusing on gene expression we only take that part
+gene_cts = h5data$`Gene Expression`
+gene_cts
+```
+
+```{r}
+# Setting min.cells, min.features are already quality controlling.
+seurat_obj <- CreateSeuratObject(counts = gene_cts, project = "NSCLC", min.cells = 3, min.features = 200)
+str(seurat_obj)
+```
+
+### Quality Control
+
+Excluding low quality cells are important in analyzing single cells.
+
+```{r}
+# Calculate the mitochondrial read percentage
+seurat_obj[["percent_mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+# Check the metadata for column values
+View(seurat_obj@meta.data)
+# Violin Plot of Each Features
+VlnPlot(seurat_obj, features = c("nFeature_RNA", "nCount_RNA", "percent_mt"), ncol = 3)
+# Scatter plot to visualize cell qualities
+FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + geom_smooth(method = "lm")
+```
+
+You want most of the cells to be in the identity line. You can see that the later cells fall down a bit.
+
+-   Lower Right corner: experiment only captured a few genes but have copied them multiple times.
+
+-   Upper Left corner: experiment detected high number of genes but have not sequenced them.
+
+```{r}
+# Filter Data
+seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent_mt < 5)
+# Normalize Data
+seurat_obj <- NormalizeData(seurat_obj)
+# Identify Highly Variable Genes
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = 'vst', nfeatures = 2000)
+# Scale Data
+allgenes <- rownames(seurat_obj)
+seurat_obj <- ScaleData(seurat_obj, features = allgenes)
+# Perform Linear Dimensionality Reduction
+seurat_obj <- RunPCA(seurat_obj, features = VariableFeatures(seurat_obj))
+DimHeatmap(seurat_obj, dims = 1, cells = 500, balanced = TRUE)
+# Elbow plot
+ElbowPlot(seurat_obj)
+# Clustering
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:15)
+# Understanding Resolution
+seurat_obj <- FindClusters(seurat_obj, resolution = c(0.1, 0.3, 0.5))
+DimPlot(seurat_obj, group.by = "RNA_snn_res.0.5")
+# UMAP
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:15)
+DimPlot(seurat_obj, reduction = "umap")
+gc()
+```
+
+## Integrating Single Cell RNA seq datasets
+
+### When do you need to integrate cell data?
+
+-   Integrating multiple scRNA-seq dataets (treated / untreated)
+
+-   Cell Label Transfer: transfer cell type classifications from a reference to a query dataset
+
+-   Integration of multimodal sc data IMPORTANT!
+
+-   Integration of scRNA-seq and spatial expression data
+
+### Different Types of Integration
+
+1.  Horizontal Integration
+
+Same modality from independent cells. ex)scRNA-seq from same tissue from different patients
+
+Assays are anchored by common gene set
+
+2.  Vertical Integration
+
+Multiple modalities profiled on same cells ex)scRNA-seq and scATAC-seq on the same cells
+
+Assays are anchored by cells
+
+3.  Diagonal Integration
+
+Different modalities from different cells
+
+### Batch Correction methods
+
+Seurat, LIGER, Harmony, Scmap, scanorama, scalign, scVI, MNN...
+
+```{r}
+# The classical way of generating individual seurat objects
+
+dirs <- list.dirs(path = "data/GSE/", recursive = FALSE, full.names = FALSE)
+
+for(x in dirs){
+  name <-gsub("_filtered_feature_bc_matrix", "", x)
+  cts <- ReadMtx(mtx = paste0('data/GSE/', x, '/matrix.mtx.gz'),
+                 features = paste0('data/GSE/', x, '/features.tsv.gz'),
+                 cells = paste0('data/GSE/', x, '/barcodes.tsv.gz'))
+  assign(name, CreateSeuratObject(counts = cts))
+}
+# Merge all the Seurat Object
+merged_seurat = merge(HB17_background, y = c(HB17_PDX, HB17_tumor, HB30_PDX, HB30_tumor, HB53_background, HB53_tumor),
+                      add.cell.ids = c("HB17_background", "HB17_PDX", "HB17_tumor","HB30_PDX","HB30_tumor","HB53_background","HB53_tumor"),
+                      project = "HB")
+```
+
+Now that we merged our object, we go on with processing
+
+```{r}
+merged_seurat$sample <- rownames(merged_seurat@meta.data)
+merged_seurat@meta.data <- separate(merged_seurat@meta.data, col = "sample", into = c("Patient", "Type", "Barcode"), sep = "_")
+
+View(merged_seurat@meta.data)
+# Sanity Check
+unique(merged_seurat@meta.data$Patient)
+unique(merged_seurat@meta.data$Type)
+
+# QUALITY CONTROL
+
+# calculate mitochondrial percentage
+merged_seurat$percent_mt <- PercentageFeatureSet(merged_seurat, pattern='^MT-')
+
+merged_seurat_filtered <- subset(merged_seurat, subset = nCount_RNA > 800 & nFeature_RNA > 500 & percent_mt < 10)
+
+# Perform standard workflow to see batch effects
+merged_seurat_filtered <- NormalizeData(object = merged_seurat_filtered)
+merged_seurat_filtered <- FindVariableFeatures(object = merged_seurat_filtered)
+merged_seurat_filtered <- ScaleData(object = merged_seurat_filtered)
+merged_seurat_filtered <- RunPCA(object = merged_seurat_filtered)
+ElbowPlot(merged_seurat_filtered)
+merged_seurat_filtered <- FindNeighbors(object = merged_seurat_filtered, dims = 1:20)
+merged_seurat_filtered <- FindClusters(object = merged_seurat_filtered)
+merged_seurat_filtered <- RunUMAP(object = merged_seurat_filtered, dims = 1:20)
+```
+
+We will plot the dataset
+
+```{r}
+p1 <- DimPlot(merged_seurat_filtered, reduction = 'umap', group.by = "Patient")
+p2 <- DimPlot(merged_seurat_filtered, reduction = 'umap', group.by = "Type", cols = c('red','green', 'blue'))
+
+p1+p2
+
+```
+
+We now see the batch effect clearly influencing the clustering.
+
+```{r}
+obj.list <- SplitObject(merged_seurat_filtered, split.by='Patient')
+for(i in 1:length(obj.list)){
+  obj.list[[i]] <- NormalizeData(object = obj.list[[i]])
+  obj.list[[i]] <- FindVariableFeatures(object = obj.list[[i]])
+}
+# Select Integration Features
+int_features <- SelectIntegrationFeatures(object.list = obj.list)
+
+# Find Integration Anchors (CCA)
+anchors <- FindIntegrationAnchors(object.list = obj.list,
+                                  anchor.features = int_features)
+seurat.integrated <- IntegrateData(anchorset = anchors)
+seurat.integrated <- ScaleData(object = seurat_integrated)
+seurat.integrated <- RunPCA(object = seurat_integrated)
+seurat.integrated <- RunUMAP(object = seurat_integrated, dims = 1:50)
+p1 <- DimPlot(seurat.integrated, reduction = 'umap', group.by = "Patient")
+p2 <- DimPlot(seurat.integrated, reduction = 'umap', group.by = "Type", cols = c('red','green', 'blue'))
+p1+p2
+gc()
+```
+
+## Detecting Doublets
+
+Two types of doublets
+
+1.  Homotypic doublets
+2.  Heterotypic doublets
+
+Doublet Finder requires 3 parameters. - pN = the number of artificial doublets - pK = the neighborhood size used to compute the number of artificial nearest neighbors - Exp = the number of expected real doublets.
+
+Highly dependent on pK. have to make sure you optimize this value.
+
+Best practices in Doublet Finder - Doublet Finder should not be applied on aggregated scRNA-seq data - Not preferable to run on merged data. will experience crash. - Should be run on distinct samples separately - Input data should be cleared of low quality cells - Remove clusters with low RNA UMIs, high mitochondrial read% and uninformative marker genes.
+
+```{r}
+cts <- ReadMtx(mtx = paste0('data/doublet/matrix.mtx.gz'),
+               features = paste0('data/doublet/features.tsv.gz'),
+               cells = paste0('data/doublet/barcodes.tsv.gz'))
+doublet_seurat <- CreateSeuratObject(counts = cts)
+
+# QC and Filtering
+doublet_seurat$percent_mt <- PercentageFeatureSet(doublet_seurat, pattern = '^MT-')
+doublet_seurat <- subset(doublet_seurat, subset = nCount_RNA > 800 & nFeature_RNA > 500 & percent_mt < 10)
+doublet_seurat <- NormalizeData(object = doublet_seurat)
+doublet_seurat <- FindVariableFeatures(object = doublet_seurat)
+doublet_seurat <- ScaleData(object = doublet_seurat)
+doublet_seurat <- RunPCA(object = doublet_seurat)
+ElbowPlot(doublet_seurat)
+
+doublet_seurat <- FindNeighbors(object = doublet_seurat, dims = 1:20)
+doublet_seurat <- FindClusters(object = doublet_seurat)
+doublet_seurat <- RunUMAP(object = doublet_seurat, dims = 1:20)
+
+# These steps should be ran before running doublet finder
+```
+
+Now you are ready to run doublet finder
+
+```{r}
+sweep_res = paramSweep_v3(doublet_seurat, PCs = 1:20, sct = FALSE)
+sweep_stat = summarizeSweep(doublet_seurat, GT = FALSE)
+bc <- find.pK(doublet_seurat)
+
+ggplot(bc, aes(pK, BCmetric, group = 1)) + geom_point() + geom_line()
+
+pK <- bc %>%
+  filter(BCmetric == max(BCmetric)) %>%
+  select(pK)
+pK <- as.numeric(as.character(pk[[1]]))
+pK <- 0.21
+```
+
+Homotypic doublet finder
+
+```{r}
+annotations <- doublet_seurat$seurat_clusters
+homotypic_prop <- modelHomotypic(annotations)
+nExp_poi <- round(0.076 * nrow(doublet_seurat@meta.data))
+adj_nExp_poi <- round(nExp_poi * (1 - homotypic_prop))
+
+doubletfinder_res = doubletFinder_v3(doublet_seurat,
+                                     PCs = 1:20,
+                                     pN = 0.25,
+                                     pK = pK,
+                                     nExp = adj_nExp_poi,
+                                     reuse.pANN = FALSE,
+                                     sct = FALSE)
+DimPlot(doubletfinder_res, reduction = "umap", group.by = "DF.classifications_0.25_0.21_691")
+gc()
+```
+
+You can now filter out these doublets before moving down stream.
