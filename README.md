@@ -7,6 +7,7 @@ JuHyunJeon
 
 This is a github project following the youtube series made for single
 cell analysis.
+This project encompasses the Quality Control, Merging Data, and Doublet finding process of single cell analysis
 
 ### Installing libraries.
 
